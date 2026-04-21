@@ -1,0 +1,96 @@
+title Spring Boot Secured Service: Full Lifecycle (User Mgmt + Auth + DB Ops + Audit)
+
+actor Admin (Manager/Lead)
+actor User
+participant Security Filter
+participant Auth & Routing
+participant Audit Service
+database Audit DB
+participant DB Controller
+participant External Email
+
+group Phase 0: User Management (Admin & Credentials)
+    Admin (Manager/Lead)->Security Filter: POST /api/admin/users (New Lead/Manager data)
+    Security Filter->Auth & Routing: Validate Admin Session
+    Auth & Routing->DB Controller: Persist New User Profile & Encrypted Pwd
+    Auth & Routing->Audit Service: logAdminAction(AdminID, "ADDED_USER", TargetID)
+    Audit Service->Audit DB: INSERT INTO audit_logs
+    Auth & Routing-->Admin (Manager/Lead): 201 Created
+    
+    space 1
+    
+    User->Security Filter: POST /api/user/change-password (Old, New)
+    Security Filter->Auth & Routing: Validate Identity
+    Auth & Routing->DB Controller: Update Password Hash
+    Auth & Routing->Audit Service: logUserAction(UserID, "PASSWORD_CHANGE")
+    Audit Service->Audit DB: INSERT INTO audit_logs
+    Auth & Routing-->User: 200 OK
+end
+
+space 2
+
+group Phase 1: Token Request & Cooldown Logic
+    User->Auth & Routing: POST /api/auth/request-token (UserId)
+    box over Auth & Routing: Check 15-min cooldown (Global/User level)
+    
+    alt Is within 15 min cooldown?
+        Auth & Routing-->User: 429 Too Many Requests: "Already raised by USER_ID..."
+    else Cooldown expired or First Request
+        Auth & Routing->Audit Service: logRequest(UserId, "TOKEN_REQUESTED")
+        Audit Service->Audit DB: INSERT INTO audit_logs
+        
+        alt Request Count 1-2
+            Auth & Routing->External Email: Send Approval Link (To: Manager)
+        else Request Count 3-7
+            Auth & Routing->External Email: Send Approval Link (To: Lead)
+        end
+        External Email-->Admin (Manager/Lead): Email Delivered
+        Auth & Routing-->User: 202 Accepted: Approval Pending
+    end
+end
+
+space 2
+
+group Phase 2: Token Approval & Generation
+    Admin (Manager/Lead)->Auth & Routing: GET /api/auth/generate-token?reqId=xyz
+    box over Auth & Routing: Validate Approver Role (Manager/Lead)
+    box over Auth & Routing: Generate 15-min JWT
+    Auth & Routing->Audit Service: logApproval(AdminID, UserID, TokenID)
+    Audit Service->Audit DB: INSERT INTO audit_logs
+    Auth & Routing->External Email: Send Token to User
+    External Email-->User: Email Delivered with JWT
+    Auth & Routing-->Admin (Manager/Lead): 200 OK
+end
+
+space 2
+
+group Phase 3: Audited Database Operations (Swagger)
+    User->Security Filter: PUT /api/db/update-table (Bearer Token)
+    Security Filter->Security Filter: Validate JWT Signature/Expiry
+    
+    alt Token Valid
+        Security Filter->DB Controller: SELECT (Fetch Current State)
+        DB Controller-->Security Filter: Old Record Data
+        
+        Security Filter->DB Controller: UPDATE (Modify Data)
+        DB Controller-->Security Filter: Update Success
+        
+        Security Filter->Audit Service: logDataChange(UserID, Table, OldVal, NewVal)
+        Audit Service->Audit DB: INSERT INTO audit_logs (JSON BLOBs)
+        Security Filter-->User: 200 OK: Data Updated
+    end
+end
+
+space 2
+
+group Phase 4: End Execution & Final Reporting
+    User->Auth & Routing: POST /api/auth/end-execution
+    box over Auth & Routing: Revoke Token / Blacklist
+    Auth & Routing->Audit Service: getSessionLogs(TokenID)
+    Audit Service->Audit DB: SELECT * FROM audit_logs WHERE token_id = ?
+    Audit DB-->Audit Service: Session Data
+    Audit Service-->Auth & Routing: Formatted Audit Report
+    Auth & Routing->External Email: Send Report (To: Manager, CC: Lead/User)
+    External Email-->Admin (Manager/Lead): Detailed Audit Email
+    Auth & Routing-->User: 200 OK: Execution Completed
+end
